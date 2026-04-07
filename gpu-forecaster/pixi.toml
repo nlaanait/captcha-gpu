@@ -1,0 +1,25 @@
+[workspace]
+channels = ["conda-forge"]
+name = "gpu-forecaster"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# Monorepo API Commands (Proxied to lambda-cloud-api)
+monitor = "cargo run --manifest-path ../lambda-cloud-api/Cargo.toml --release -- monitor"
+instances = "cargo run --manifest-path ../lambda-cloud-api/Cargo.toml --release -- instances"
+check = "cargo run --manifest-path ../lambda-cloud-api/Cargo.toml --release -- check"
+types = "cargo run --manifest-path ../lambda-cloud-api/Cargo.toml --release -- types"
+captcha-gpu = "cargo run --manifest-path ../lambda-cloud-api/Cargo.toml --release -- captcha-gpu"
+
+# Forecasting & Modeling Tasks
+train = "python src/train_models.py"
+predict = "python src/main.py"
+strategy = "python src/api_strategy.py"
+evaluate = "python src/evaluate_all_gpus.py"
+
+[dependencies]
+neuralprophet = ">=0.6.2,<0.7"
+pandas = ">=1.5.3,<2"
+setuptools = "<70"
+scikit-learn = ">=1.7.2,<2"
