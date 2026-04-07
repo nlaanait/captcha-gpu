@@ -6,6 +6,7 @@ version = "0.1.0"
 
 [tasks]
 # Monorepo API Commands (Rust tool)
+stats = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- stats"
 monitor = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- monitor"
 instances = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- instances"
 check = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- check"

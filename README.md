@@ -4,14 +4,17 @@ This monorepo contains tools for monitoring, managing, and forecasting GPU insta
 
 ## Projects
 
-### 1. `lambda-cloud-api` 
+### 1. `lambda-cloud-api`
+
 A command-line client to monitor and manage Lambda Cloud resources.
 
 - **Monitor Availability**: Watch for specific GPU types (A100, GH200, etc.) and get alerts.
 - **Launch & Manage**: Interactively launch instances and manage firewall rules.
 - **Pricing & Status**: View current instances, regions, and pricing.
+- **Track Availability**: Sample the availability of various instances across regions.
 
-### 2. `gpu-forecaster` 
+### 2. `gpu-forecaster`
+
 A machine learning package for forecasting GPU availability trends using historical data.
 
 - **Availability Prediction**: Predicts future availability of high-demand GPU types.
@@ -28,12 +31,13 @@ A machine learning package for forecasting GPU availability trends using histori
 
 ## Usage
 
-Most monorepo commands can be run from the `gpu-forecaster` directory using [Pixi](https://pixi.sh).
+Most monorepo commands can be run from the root directory using [Pixi](https://pixi.sh).
 
 ### Monorepo API Commands (Proxied to Rust tool)
+
 ```bash
-cd gpu-forecaster
 pixi run monitor        # Watch for specific instance types
+pixi run stats          # Sample instances availability timeline
 pixi run instances      # List your launched instances
 pixi run check          # One-time check for specific GPU availability
 pixi run types          # List all instance types and their status
@@ -41,8 +45,8 @@ pixi run captcha-gpu    # Forecast-driven polling strategy for acquiring GPUs
 ```
 
 ### Forecasting & Modeling Tasks
+
 ```bash
-cd gpu-forecaster
 pixi run train          # Train NeuralProphet models on historical data
 pixi run predict        # Run manual prediction for a specific GPU/time
 pixi run strategy       # Generate detailed polling strategy JSON
@@ -50,7 +54,9 @@ pixi run evaluate       # Evaluate model performance across all GPUs
 ```
 
 ### Direct Rust Tool Usage
+
 Alternatively, you can run the API client directly from its directory:
+
 ```bash
 cd lambda-cloud-api
 cargo run --release -- [COMMAND]
