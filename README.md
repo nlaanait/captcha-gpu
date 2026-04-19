@@ -37,7 +37,7 @@ Most monorepo commands can be run from the root directory using [Pixi](https://p
 
 ```bash
 pixi run monitor        # Watch for specific instance types
-pixi run stats          # Sample instances availability timeline
+pixi run stats          # Sample instances availability timeline and trigger retraining
 pixi run instances      # List your launched instances
 pixi run check          # One-time check for specific GPU availability
 pixi run types          # List all instance types and their status
