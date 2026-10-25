@@ -2,6 +2,12 @@
 name = "lambda-cloud-api"
 version = "0.1.0"
 edition = "2021"
+description = "Check, monitor, and forecast Lambda Cloud GPU availability"
+autobins = false
+
+[[bin]]
+name = "captcha-gpu"
+path = "src/main.rs"
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json"] }

@@ -393,3 +393,192 @@ pub async fn launch_and_setup(
 
     Ok(())
 }
+
+/// One concrete launch the poll loop is allowed to try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchTarget {
+    pub instance_type: String,
+    pub region: String,
+    pub gpu_label: String,
+}
+
+/// What one poll produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollBatch<T> {
+    /// Try these launches. An empty list means nothing was available.
+    Candidates(Vec<T>),
+    /// Stop polling without launching. Used when a forecast window is over.
+    Stop,
+}
+
+/// Why [`poll_until_acquired`] returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum AcquireStop<T> {
+    /// The first successful launch. No further polls or launches were made.
+    Acquired(T),
+    /// The fetcher asked to stop, or no launch succeeded before it did.
+    Exhausted,
+}
+
+/// Poll until one launch succeeds, then stop.
+///
+/// A successful launch returns immediately. Later candidates in that batch are
+/// not launched, and `fetch` / `wait` are not called again. A failed launch is
+/// logged and the next candidate is tried. `wait` runs only after a batch that
+/// did not acquire an instance.
+pub async fn poll_until_acquired<T, F, L, W>(
+    mut fetch: F,
+    mut launch: L,
+    mut wait: W,
+) -> Result<AcquireStop<T>>
+where
+    T: Clone,
+    F: AsyncFnMut() -> Result<PollBatch<T>>,
+    L: AsyncFnMut(T) -> Result<()>,
+    W: AsyncFnMut() -> (),
+{
+    loop {
+        match fetch().await? {
+            PollBatch::Stop => return Ok(AcquireStop::Exhausted),
+            PollBatch::Candidates(candidates) => {
+                let mut acquired = None;
+                for candidate in candidates {
+                    let record = candidate.clone();
+                    match launch(candidate).await {
+                        Ok(()) => {
+                            acquired = Some(record);
+                            break;
+                        }
+                        Err(err) => eprintln!("❌ Launch failed: {}", err),
+                    }
+                }
+                if let Some(target) = acquired {
+                    return Ok(AcquireStop::Acquired(target));
+                }
+                wait().await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn target(instance_type: &str, region: &str) -> LaunchTarget {
+        LaunchTarget {
+            instance_type: instance_type.to_string(),
+            region: region.to_string(),
+            gpu_label: "gh200".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_launch_stops_without_another_poll_or_launch() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let polls_c = polls.clone();
+        let launches_c = launches.clone();
+        let waits_c = waits.clone();
+
+        let first = target("gpu_1x_gh200", "us-east-3");
+        let second = target("gpu_8x_gh200", "us-west-1");
+        let expected = first.clone();
+
+        let stop = poll_until_acquired(
+            async || {
+                let n = polls_c.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(n, 0, "polled again after a successful launch");
+                Ok(PollBatch::Candidates(vec![first.clone(), second.clone()]))
+            },
+            async |_target| {
+                let n = launches_c.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(n, 0, "launched again after success");
+                Ok(())
+            },
+            async || {
+                waits_c.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stop, AcquireStop::Acquired(expected));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(waits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_launch_retries_then_stops_on_the_next_success() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let polls_c = polls.clone();
+        let launches_c = launches.clone();
+        let waits_c = waits.clone();
+
+        let stop = poll_until_acquired(
+            async || {
+                let n = polls_c.fetch_add(1, Ordering::SeqCst);
+                let batch = if n == 0 {
+                    vec![target("gpu_1x_gh200", "us-east-3")]
+                } else {
+                    assert_eq!(n, 1, "kept polling after a successful launch");
+                    vec![
+                        target("gpu_1x_gh200", "us-east-3"),
+                        target("gpu_1x_gh200", "us-west-1"),
+                    ]
+                };
+                Ok(PollBatch::Candidates(batch))
+            },
+            async |_target| {
+                let n = launches_c.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    anyhow::bail!("capacity disappeared");
+                }
+                assert!(n < 2, "launched again after success");
+                Ok(())
+            },
+            async || {
+                waits_c.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stop, AcquireStop::Acquired(target("gpu_1x_gh200", "us-east-3")));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        assert_eq!(waits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_ends_the_loop_without_launching() {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let launches_c = launches.clone();
+        let waits_c = waits.clone();
+
+        let stop = poll_until_acquired(
+            async || Ok::<_, anyhow::Error>(PollBatch::Stop),
+            async |_target: LaunchTarget| {
+                launches_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            async || {
+                waits_c.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stop, AcquireStop::<LaunchTarget>::Exhausted);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert_eq!(waits.load(Ordering::SeqCst), 0);
+    }
+}

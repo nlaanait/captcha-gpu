@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 use csv::WriterBuilder;
 use dialoguer::{Confirm, Select};
 use dotenvy::dotenv;
-use lambda_cloud_api::{LambdaCloudClient, LambdaConfig, launch_and_setup};
+use lambda_cloud_api::{
+    launch_and_setup, AcquireStop, LambdaCloudClient, LambdaConfig, LaunchTarget, PollBatch,
+    poll_until_acquired,
+};
 use rand::Rng;
 use serde::Deserialize;
 use std::env;
@@ -30,16 +33,38 @@ struct SlotStrategy {
 }
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    name = "captcha-gpu",
+    version,
+    about = "Check, monitor, and forecast Lambda Cloud GPU availability"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Captcha-GPU: Polling strategy to acquire GPU instance
-    CaptchaGpu {
+    /// Check which GPUs are available right now
+    Check {
+        /// Instance types to check (e.g., a10, a100, gh200)
+        #[arg(short, long, value_delimiter = ',')]
+        types: Option<Vec<String>>,
+    },
+    /// Watch availability and launch when a GPU appears
+    Monitor {
+        /// Instance types to monitor (e.g., a10, a100, gh200)
+        #[arg(short, long, value_delimiter = ',')]
+        types: Option<Vec<String>>,
+        /// Interval in seconds between checks
+        #[arg(short, long, default_value_t = 30)]
+        interval: u64,
+        /// Launch the first available match without prompting
+        #[arg(long)]
+        auto_launch: bool,
+    },
+    /// Forecast when a GPU is likely available and poll to acquire it
+    Forecast {
         /// Instance type to capture (e.g., gpu_1x_a10)
         #[arg(short, long)]
         gpu: String,
@@ -52,21 +77,6 @@ enum Commands {
         /// Simulate the launch without actually creating the instance
         #[arg(long)]
         dry_run: bool,
-    },
-    /// Continuously monitor availability and launch instances
-    Monitor {
-        /// Instance types to monitor (e.g., a10, a100, gh200)
-        #[arg(short, long, value_delimiter = ',')]
-        types: Option<Vec<String>>,
-        /// Interval in seconds between checks
-        #[arg(short, long, default_value_t = 30)]
-        interval: u64,
-    },
-    /// Check availability of specific instance types (one-time)
-    Check {
-        /// Instance types to check (e.g., a10, a100, gh200)
-        #[arg(short, long, value_delimiter = ',')]
-        types: Option<Vec<String>>,
     },
     /// List all your launched instances
     Instances,
@@ -97,8 +107,8 @@ async fn main() -> Result<()> {
     let api_key = env::var("LAMBDA_CLOUD_API_KEY").context("LAMBDA_CLOUD_API_KEY environment variable not set")?;
     let client = LambdaCloudClient::new(api_key);
 
-    match cli.command.unwrap_or(Commands::Instances) {
-        Commands::CaptchaGpu { gpu, start, top, dry_run } => {
+    match cli.command {
+        Commands::Forecast { gpu, start, top, dry_run } => {
             let (general_limit, _launch_limit) = LambdaCloudClient::get_api_rate_limit();
             // Respect the 1 req/sec limit (3600/hour) with a safety margin
             let max_hourly_budget = std::cmp::min(3000, (general_limit as f64 * 0.85) as u64);
@@ -217,60 +227,92 @@ async fn main() -> Result<()> {
                 println!("📦 Block {} to {}: Budget {} requests (Avg interval: {:.2}s)", 
                     block_start, block_end, block_budget, target_interval);
 
-                for i in 0..block_budget {
-                    if Local::now().naive_local() > block_end {
-                        println!("⏰ Block time ended.");
-                        break;
-                    }
+                let mut requests_sent = 0u64;
+                let stop = poll_until_acquired(
+                    async || {
+                        if Local::now().naive_local() > block_end {
+                            println!("⏰ Block time ended.");
+                            return Ok(PollBatch::Stop);
+                        }
+                        if requests_sent >= block_budget {
+                            return Ok(PollBatch::Stop);
+                        }
+                        requests_sent += 1;
 
-                    println!("[{}] 🔍 (Req {}/{}) Polling API for {}...", Local::now().format("%H:%M:%S"), i+1, block_budget, gpu);
-                    
-                    match client.get_instance_types().await {
-                        Ok(response) => {
-                            let mut found = false;
-                            for (name, availability) in response.data {
-                                let name_lower = name.to_lowercase();
-                                let target_lower = gpu.to_lowercase();
-                                let matches = if target_lower == "a10" {
-                                    name_lower.contains("a10") && !name_lower.contains("a100")
-                                } else {
-                                    name_lower.contains(&target_lower)
-                                };
+                        println!(
+                            "[{}] 🔍 (Req {}/{}) Polling API for {}...",
+                            Local::now().format("%H:%M:%S"),
+                            requests_sent,
+                            block_budget,
+                            gpu
+                        );
 
-                                if matches && !availability.regions_with_capacity_available.is_empty() {
-                                    found = true;
-                                    let region = availability.regions_with_capacity_available[0].name.clone();
-                                    println!("🚨 BINGO! {} IS AVAILABLE in {}! 🚨", name, region);
-                                    
-                                    if dry_run {
-                                        println!("[DRY RUN] Would launch {} in {}", name, region);
-                                        return Ok(());
+                        match client.get_instance_types().await {
+                            Ok(response) => {
+                                let mut attempts = Vec::new();
+                                for (name, availability) in response.data {
+                                    let name_lower = name.to_lowercase();
+                                    let target_lower = gpu.to_lowercase();
+                                    let matches = if target_lower == "a10" {
+                                        name_lower.contains("a10") && !name_lower.contains("a100")
                                     } else {
-                                        match launch_and_setup(&client, &config, &name, &gpu, &region).await {
-                                            Ok(_) => return Ok(()),
-                                            Err(e) => eprintln!("❌ Launch failed: {}", e),
-                                        }
+                                        name_lower.contains(&target_lower)
+                                    };
+
+                                    if matches && !availability.regions_with_capacity_available.is_empty() {
+                                        let region = availability.regions_with_capacity_available[0].name.clone();
+                                        println!("🚨 BINGO! {} IS AVAILABLE in {}! 🚨", name, region);
+                                        attempts.push(LaunchTarget {
+                                            instance_type: name,
+                                            region,
+                                            gpu_label: gpu.clone(),
+                                        });
                                     }
                                 }
+                                if attempts.is_empty() {
+                                    println!("   ❌ Not available yet.");
+                                }
+                                Ok(PollBatch::Candidates(attempts))
                             }
-                            if !found {
-                                println!("   ❌ Not available yet.");
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                eprintln!("❌ API Error: {}", err_msg);
+                                if err_msg.contains("429") {
+                                    println!("⚠️  Rate limit hit! Cooling down for 5 seconds...");
+                                    sleep(Duration::from_secs(5)).await;
+                                }
+                                Ok(PollBatch::Candidates(Vec::new()))
                             }
                         }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            eprintln!("❌ API Error: {}", err_msg);
-                            if err_msg.contains("429") {
-                                println!("⚠️  Rate limit hit! Cooling down for 5 seconds...");
-                                sleep(Duration::from_secs(5)).await;
-                            }
+                    },
+                    async |attempt: LaunchTarget| {
+                        if dry_run {
+                            println!(
+                                "[DRY RUN] Would launch {} in {}",
+                                attempt.instance_type, attempt.region
+                            );
+                            return Ok(());
                         }
-                    }
+                        launch_and_setup(
+                            &client,
+                            &config,
+                            &attempt.instance_type,
+                            &attempt.gpu_label,
+                            &attempt.region,
+                        )
+                        .await
+                    },
+                    async || {
+                        let sleep_time = target_interval + rng.gen_range(-jitter_range..jitter_range);
+                        if sleep_time > 0.0 {
+                            sleep(Duration::from_secs_f64(sleep_time)).await;
+                        }
+                    },
+                )
+                .await?;
 
-                    let sleep_time = target_interval + rng.gen_range(-jitter_range..jitter_range);
-                    if sleep_time > 0.0 {
-                        sleep(Duration::from_secs_f64(sleep_time)).await;
-                    }
+                if matches!(stop, AcquireStop::Acquired(_)) {
+                    return Ok(());
                 }
             }
             println!("🏁 Timeslot polling finished.");
@@ -354,83 +396,124 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(wait_secs)).await;
             }
         }
-        Commands::Monitor { types, interval } => {
+        Commands::Monitor { types, interval, auto_launch } => {
             let target_types = types.unwrap_or_else(|| vec!["a10".to_string(), "a100".to_string(), "gh200".to_string()]);
             println!("👀 Monitoring availability for: {:?}", target_types);
             println!("⏱️  Interval: {} seconds", interval);
+            if auto_launch {
+                println!("🚀 Auto-launch: enabled (first available region)");
+            }
             println!("Press Ctrl+C to stop.\n");
 
             let mut sample_count = 0;
-            loop {
-                sample_count += 1;
-                if sample_count >= 500 {
-                    println!("🔄 Collecting 500 samples. Triggering retraining...");
-                    let status = std::process::Command::new("python3")
-                        .arg("retrain_models.py")
-                        .status();
-                    
-                    match status {
-                        Ok(s) if s.success() => println!("✅ Retraining complete."),
-                        Ok(s) => eprintln!("❌ Retraining failed with exit code: {}", s),
-                        Err(e) => eprintln!("❌ Failed to start retraining process: {}", e),
+            let stop = poll_until_acquired(
+                async || {
+                    sample_count += 1;
+                    if sample_count >= 500 {
+                        println!("🔄 Collecting 500 samples. Triggering retraining...");
+                        let status = std::process::Command::new("python3")
+                            .arg("retrain_models.py")
+                            .status();
+
+                        match status {
+                            Ok(s) if s.success() => println!("✅ Retraining complete."),
+                            Ok(s) => eprintln!("❌ Retraining failed with exit code: {}", s),
+                            Err(e) => eprintln!("❌ Failed to start retraining process: {}", e),
+                        }
+                        sample_count = 0;
                     }
-                    sample_count = 0;
-                }
 
-                match client.get_instance_types().await {
-                    Ok(response) => {
-                        for (name, availability) in response.data {
-                            let name_lower = name.to_lowercase();
-                            let is_match = target_types.iter().any(|t| {
-                                let t_lower = t.to_lowercase();
-                                if t_lower == "a10" && name_lower.contains("a100") {
-                                    return false;
+                    match client.get_instance_types().await {
+                        Ok(response) => {
+                            let mut attempts = Vec::new();
+                            for (name, availability) in response.data {
+                                let name_lower = name.to_lowercase();
+                                let is_match = target_types.iter().any(|t| {
+                                    let t_lower = t.to_lowercase();
+                                    if t_lower == "a10" && name_lower.contains("a100") {
+                                        return false;
+                                    }
+                                    name_lower.contains(&t_lower)
+                                });
+
+                                if !is_match {
+                                    continue;
                                 }
-                                name_lower.contains(&t_lower)
-                            });
-
-                            if is_match {
                                 let available_regions = &availability.regions_with_capacity_available;
-                                if !available_regions.is_empty() {
-                                    let price = availability.instance_type.price_cents_per_hour.unwrap_or(0);
-                                    println!("\n🔔 ALERT: {} is AVAILABLE in:", name);
-                                    println!("   💰 Price: ${:.2}/hour", price as f64 / 100.0);
-                                    for region in available_regions {
-                                        println!("   - {} ({})", region.name, region.description);
-                                    }
+                                if available_regions.is_empty() {
+                                    continue;
+                                }
 
-                                    if Confirm::new()
-                                        .with_prompt(format!("Do you want to launch a {} instance?", name))
-                                        .default(false)
-                                        .interact()?
-                                    {
-                                        // 1. Select Region
-                                        let region_options: Vec<String> = available_regions.iter().map(|r| r.name.clone()).collect();
-                                        let region_idx = Select::new()
-                                            .with_prompt("Select a region")
-                                            .items(&region_options)
-                                            .default(0)
-                                            .interact()?;
-                                        let selected_region = region_options[region_idx].clone();
+                                let price = availability.instance_type.price_cents_per_hour.unwrap_or(0);
+                                println!("\n🔔 ALERT: {} is AVAILABLE in:", name);
+                                println!("   💰 Price: ${:.2}/hour", price as f64 / 100.0);
+                                for region in available_regions {
+                                    println!("   - {} ({})", region.name, region.description);
+                                }
 
-                                        let config = LambdaConfig::from_env();
-                                        let gpu_type = target_types.iter()
-                                            .find(|t| name.to_lowercase().contains(&t.to_lowercase()))
-                                            .cloned()
-                                            .unwrap_or_else(|| name.clone());
-                                            
-                                        match launch_and_setup(&client, &config, &name, &gpu_type, &selected_region).await {
-                                            Ok(_) => return Ok(()),
-                                            Err(e) => eprintln!("❌ Launch failed: {}", e),
-                                        }
-                                    }
+                                let selected_region = if auto_launch {
+                                    let region = available_regions[0].name.clone();
+                                    println!("🚀 Auto-launching {} in {}...", name, region);
+                                    Some(region)
+                                } else if Confirm::new()
+                                    .with_prompt(format!("Do you want to launch a {} instance?", name))
+                                    .default(false)
+                                    .interact()?
+                                {
+                                    let region_options: Vec<String> = available_regions
+                                        .iter()
+                                        .map(|r| r.name.clone())
+                                        .collect();
+                                    let region_idx = Select::new()
+                                        .with_prompt("Select a region")
+                                        .items(&region_options)
+                                        .default(0)
+                                        .interact()?;
+                                    Some(region_options[region_idx].clone())
+                                } else {
+                                    None
+                                };
+
+                                if let Some(region) = selected_region {
+                                    let gpu_label = target_types
+                                        .iter()
+                                        .find(|t| name.to_lowercase().contains(&t.to_lowercase()))
+                                        .cloned()
+                                        .unwrap_or_else(|| name.clone());
+                                    attempts.push(LaunchTarget {
+                                        instance_type: name,
+                                        region,
+                                        gpu_label,
+                                    });
                                 }
                             }
+                            Ok(PollBatch::Candidates(attempts))
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Error checking availability: {}", e);
+                            Ok(PollBatch::Candidates(Vec::new()))
                         }
                     }
-                    Err(e) => eprintln!("❌ Error checking availability: {}", e),
-                }
-                sleep(Duration::from_secs(interval)).await;
+                },
+                async |attempt: LaunchTarget| {
+                    let config = LambdaConfig::from_env();
+                    launch_and_setup(
+                        &client,
+                        &config,
+                        &attempt.instance_type,
+                        &attempt.gpu_label,
+                        &attempt.region,
+                    )
+                    .await
+                },
+                async || {
+                    sleep(Duration::from_secs(interval)).await;
+                },
+            )
+            .await?;
+
+            if matches!(stop, AcquireStop::Acquired(_)) {
+                return Ok(());
             }
         }
         Commands::Check { types } => {

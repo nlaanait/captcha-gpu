@@ -6,12 +6,12 @@ version = "0.1.0"
 
 [tasks]
 # Monorepo API Commands (Rust tool)
-stats = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- stats"
-monitor = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- monitor"
-instances = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- instances"
-check = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- check"
-types = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- types"
-captcha-gpu = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --release -- captcha-gpu"
+check = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- check"
+monitor = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- monitor"
+forecast = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- forecast"
+stats = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- stats"
+instances = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- instances"
+types = "cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --release -- types"
 
 # Forecasting & Modeling Tasks (Python tool)
 train = "cd gpu-forecaster && python src/train_models.py"

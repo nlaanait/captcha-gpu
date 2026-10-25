@@ -33,15 +33,25 @@ A machine learning package for forecasting GPU availability trends using histori
 
 Most monorepo commands can be run from the root directory using [Pixi](https://pixi.sh).
 
-### Monorepo API Commands (Proxied to Rust tool)
+### `captcha-gpu` modes
+
+`check`, `monitor`, and `forecast` are subcommands of the `captcha-gpu` binary.
 
 ```bash
-pixi run monitor        # Watch for specific instance types
+captcha-gpu check --types gh200          # What is available right now
+captcha-gpu monitor --types gh200        # Watch and launch when capacity appears
+captcha-gpu forecast --gpu gpu_1x_gh200  # Forecast a window, then poll to acquire it
+```
+
+The same modes are available through Pixi:
+
+```bash
+pixi run check -- --types gh200
+pixi run monitor -- --types gh200
+pixi run forecast -- --gpu gpu_1x_gh200
 pixi run stats          # Sample instances availability timeline and trigger retraining
 pixi run instances      # List your launched instances
-pixi run check          # One-time check for specific GPU availability
 pixi run types          # List all instance types and their status
-pixi run captcha-gpu    # Forecast-driven polling strategy for acquiring GPUs
 ```
 
 ### Forecasting & Modeling Tasks
@@ -59,7 +69,9 @@ Alternatively, you can run the API client directly from its directory:
 
 ```bash
 cd lambda-cloud-api
-cargo run --release -- [COMMAND]
+cargo run --bin captcha-gpu --release -- check
+cargo run --bin captcha-gpu --release -- monitor
+cargo run --bin captcha-gpu --release -- forecast --gpu gpu_1x_gh200
 ```
 
 ## Security
