@@ -4,4 +4,5 @@
 **/.venv
 **/__pycache__
 .env
+**/.captcha-gpu/
 **/lightning_logs/*

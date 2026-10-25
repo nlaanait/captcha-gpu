@@ -3,9 +3,11 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use csv::WriterBuilder;
 use dialoguer::{Confirm, Select};
+use chrono::Utc;
 use lambda_cloud_api::{
-    launch_and_setup, load_config_env, AcquireStop, LambdaCloudClient, LambdaConfig, LaunchTarget,
-    PollBatch, poll_until_acquired,
+    estimate_accrued_cost_cents, format_usd_from_cents, launch_and_setup, load_config_env,
+    resolve_instance_start_time, AcquireStop, LambdaCloudClient, LambdaConfig, LaunchTarget,
+    LaunchTimeStore, PollBatch, poll_until_acquired,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -557,6 +559,11 @@ async fn main() -> Result<()> {
             if instances.is_empty() {
                 println!("✅ No instances found. You have 0 launched instances.");
             } else {
+                let launch_store = LaunchTimeStore::load();
+                let now = Utc::now();
+                let mut total_accrued_cents = 0i64;
+                let mut estimated_count = 0usize;
+
                 println!("📊 Found {} launched instance(s):\n", instances.len());
                 for (i, instance) in instances.iter().enumerate() {
                     println!("Instance {}:", i + 1);
@@ -569,19 +576,57 @@ async fn main() -> Result<()> {
                     if let Some(pip) = &instance.private_ip {
                         println!("  Private IP: {}", pip);
                     }
+                    let price = instance
+                        .instance_type
+                        .as_ref()
+                        .and_then(|t| t.price_cents_per_hour)
+                        .or_else(|| {
+                            launch_store
+                                .instances
+                                .get(&instance.id)
+                                .and_then(|r| r.price_cents_per_hour)
+                        });
                     if let Some(instance_type) = &instance.instance_type {
                         println!("  Type: {}", instance_type.name);
-                        if let Some(price) = instance_type.price_cents_per_hour {
+                        if let Some(price) = price {
                             println!("  Price: ${:.2}/hour", price as f64 / 100.0);
                         }
                     }
                     if let Some(region) = &instance.region {
-                        println!("  Region: {}", region);
+                        println!("  Region: {}", region.display_name());
                     }
-                    if let Some(created) = &instance.created {
+                    let started_at = resolve_instance_start_time(instance, &launch_store);
+                    if let Some(started) = started_at {
+                        println!("  Started: {}", started.to_rfc3339());
+                    } else if let Some(created) = &instance.created {
                         println!("  Created: {}", created);
                     }
+
+                    match estimate_accrued_cost_cents(price, started_at, now) {
+                        Some(cents) => {
+                            total_accrued_cents += cents;
+                            estimated_count += 1;
+                            println!(
+                                "  Accrued (est.): {}  [minute billing; not an invoice]",
+                                format_usd_from_cents(cents)
+                            );
+                        }
+                        None => {
+                            println!(
+                                "  Accrued (est.): unknown (need start time + hourly price)"
+                            );
+                        }
+                    }
                     println!();
+                }
+
+                if estimated_count > 0 {
+                    println!(
+                        "Σ Estimated accrued across {} instance(s): {}",
+                        estimated_count,
+                        format_usd_from_cents(total_accrued_cents)
+                    );
+                    println!("Note: Lambda has no billing API; this is a local estimate.");
                 }
             }
         }

@@ -64,7 +64,7 @@ Forecast prompts for a timeslot and needs a TTY. For an unattended launch, use `
 
 ## Other subcommands
 
-- `captcha-gpu instances` — instances already launched
+- `captcha-gpu instances` — instances already launched, with estimated accrued cost (local estimate from hourly rate × minutes; Lambda has no billing API)
 - `captcha-gpu types` — every instance type and whether it has capacity
 - `captcha-gpu stats` — append availability samples to a CSV; long-running
 

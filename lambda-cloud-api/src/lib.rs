@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{create_dir_all, File};
+use std::io::{BufReader, BufWriter};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -15,9 +18,27 @@ pub struct Instance {
     pub private_ip: Option<String>,
     pub status: String,
     pub instance_type: Option<InstanceTypeInfo>,
-    pub region: Option<String>,
+    #[serde(default)]
+    pub region: Option<RegionField>,
     pub created: Option<String>,
     pub ssh_key_names: Option<Vec<String>>,
+}
+
+/// Lambda has returned region as either a string or a `{name, description}` object.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RegionField {
+    Name(String),
+    Object(Region),
+}
+
+impl RegionField {
+    pub fn display_name(&self) -> &str {
+        match self {
+            RegionField::Name(name) => name,
+            RegionField::Object(region) => &region.name,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -372,6 +393,127 @@ pub async fn resolve_firewall_ip(configured: Option<&str>) -> Result<String> {
     detect_public_ip().await
 }
 
+/// Parse an instance start timestamp from API or local records.
+pub fn parse_start_time(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Common Lambda / local formats without timezone: treat as UTC.
+    for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+        }
+    }
+    None
+}
+
+/// Estimate accrued instance cost in US cents.
+///
+/// Lambda bills ODC in one-minute increments. This uses whole minutes already
+/// started (`ceil(elapsed_seconds / 60)`, minimum 1 once the clock has started).
+/// Returns `None` when price or start time is missing, or start is in the future.
+pub fn estimate_accrued_cost_cents(
+    price_cents_per_hour: Option<i32>,
+    started_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<i64> {
+    let price = price_cents_per_hour.filter(|p| *p >= 0)?;
+    let start = started_at?;
+    let elapsed = now.signed_duration_since(start);
+    let secs = elapsed.num_seconds();
+    if secs < 0 {
+        return None;
+    }
+    let minutes = std::cmp::max(1, (secs + 59) / 60);
+    Some((price as i64) * minutes / 60)
+}
+
+pub fn format_usd_from_cents(cents: i64) -> String {
+    format!("${:.2}", cents as f64 / 100.0)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LaunchTimeStore {
+    pub instances: HashMap<String, LaunchRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LaunchRecord {
+    pub started_at: String,
+    pub instance_type: Option<String>,
+    pub price_cents_per_hour: Option<i32>,
+}
+
+impl LaunchTimeStore {
+    pub fn path() -> PathBuf {
+        let root = std::env::var("CAPTCHA_GPU_ROOT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        root.join(".captcha-gpu").join("launch_times.json")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::path();
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Self::default(),
+        };
+        serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent).context("Failed to create .captcha-gpu directory")?;
+        }
+        let file = File::create(&path).context("Failed to create launch_times.json")?;
+        serde_json::to_writer_pretty(BufWriter::new(file), self)
+            .context("Failed to write launch_times.json")?;
+        Ok(())
+    }
+
+    pub fn record_launch(
+        &mut self,
+        instance_id: &str,
+        started_at: DateTime<Utc>,
+        instance_type: Option<&str>,
+        price_cents_per_hour: Option<i32>,
+    ) {
+        self.instances.insert(
+            instance_id.to_string(),
+            LaunchRecord {
+                started_at: started_at.to_rfc3339(),
+                instance_type: instance_type.map(|s| s.to_string()),
+                price_cents_per_hour,
+            },
+        );
+    }
+
+    pub fn started_at(&self, instance_id: &str) -> Option<DateTime<Utc>> {
+        self.instances
+            .get(instance_id)
+            .and_then(|r| parse_start_time(&r.started_at))
+    }
+}
+
+/// Resolve the best available start time for accrued-cost estimation.
+pub fn resolve_instance_start_time(
+    instance: &Instance,
+    store: &LaunchTimeStore,
+) -> Option<DateTime<Utc>> {
+    instance
+        .created
+        .as_deref()
+        .and_then(parse_start_time)
+        .or_else(|| store.started_at(&instance.id))
+}
+
 pub async fn launch_and_setup(
     client: &LambdaCloudClient,
     config: &LambdaConfig,
@@ -416,6 +558,12 @@ pub async fn launch_and_setup(
     let launch_res = client.launch_instance(launch_req).await?;
     println!("✅ Instance launched! IDs: {:?}", launch_res.data.instance_ids);
     let instance_id = &launch_res.data.instance_ids[0];
+    let launch_time = Utc::now();
+    let mut launch_store = LaunchTimeStore::load();
+    launch_store.record_launch(instance_id, launch_time, Some(instance_type_name), None);
+    if let Err(e) = launch_store.save() {
+        eprintln!("⚠️ Failed to persist launch time for cost tracking: {}", e);
+    }
 
     // Setup Firewall: MY_PUBLIC_IP overrides; otherwise detect the caller's current IP.
     match resolve_firewall_ip(config.public_ip.as_deref()).await {
@@ -458,13 +606,21 @@ pub async fn launch_and_setup(
         }
     }
 
-    // Wait for IP
+    // Wait for IP. Billing starts after health checks; prefer that moment for accrual.
     println!("⏳ Waiting for instance to be active and get an IP...");
     let mut instance_ip = None;
+    let mut billing_start = launch_time;
+    let mut price_cents_per_hour = None;
     for _ in 0..60 { // 10 minutes max
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         if let Ok(instances_res) = client.get_instances().await {
             if let Some(inst) = instances_res.data.iter().find(|i| &i.id == instance_id) {
+                if let Some(instance_type) = &inst.instance_type {
+                    price_cents_per_hour = instance_type.price_cents_per_hour;
+                }
+                if inst.status == "active" || inst.ip.is_some() {
+                    billing_start = Utc::now();
+                }
                 if let Some(ip) = &inst.ip {
                     instance_ip = Some(ip.clone());
                     break;
@@ -478,6 +634,16 @@ pub async fn launch_and_setup(
         print!(".");
         use std::io::Write;
         std::io::stdout().flush().ok();
+    }
+
+    launch_store.record_launch(
+        instance_id,
+        billing_start,
+        Some(instance_type_name),
+        price_cents_per_hour,
+    );
+    if let Err(e) = launch_store.save() {
+        eprintln!("⚠️ Failed to update launch time for cost tracking: {}", e);
     }
 
     if let Some(ip) = instance_ip {
@@ -774,5 +940,58 @@ mod tests {
         // Invalid override should fall through to detection; this only asserts the
         // override path rejects garbage before network lookup by checking parse.
         assert_eq!(parse_public_ip("not-an-ip"), None);
+    }
+
+    #[test]
+    fn estimate_accrued_cost_uses_minute_increments() {
+        let start = DateTime::parse_from_rfc3339("2026-11-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after_90s = start + chrono::Duration::seconds(90);
+        // 2 billable minutes at $1.20/hr = 120 cents/hr => 4 cents
+        assert_eq!(
+            estimate_accrued_cost_cents(Some(120), Some(start), after_90s),
+            Some(4)
+        );
+        let after_0s = start;
+        assert_eq!(
+            estimate_accrued_cost_cents(Some(120), Some(start), after_0s),
+            Some(2)
+        );
+        assert_eq!(estimate_accrued_cost_cents(None, Some(start), after_90s), None);
+        assert_eq!(estimate_accrued_cost_cents(Some(120), None, after_90s), None);
+    }
+
+    #[test]
+    fn parse_start_time_accepts_common_formats() {
+        assert!(parse_start_time("2026-11-03T12:00:00Z").is_some());
+        assert!(parse_start_time("2026-11-03 12:00:00").is_some());
+        assert!(parse_start_time("not-a-time").is_none());
+    }
+
+    #[test]
+    fn resolve_instance_start_time_prefers_api_created() {
+        let mut store = LaunchTimeStore::default();
+        store.record_launch(
+            "abc",
+            DateTime::parse_from_rfc3339("2026-11-03T11:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            Some("gpu_1x_gh200"),
+            Some(149),
+        );
+        let instance = Instance {
+            id: "abc".to_string(),
+            name: None,
+            ip: None,
+            private_ip: None,
+            status: "active".to_string(),
+            instance_type: None,
+            region: None,
+            created: Some("2026-11-03T12:00:00Z".to_string()),
+            ssh_key_names: None,
+        };
+        let start = resolve_instance_start_time(&instance, &store).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-03T12:00:00+00:00");
     }
 }
