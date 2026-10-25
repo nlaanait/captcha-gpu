@@ -24,7 +24,7 @@ A machine learning package for forecasting GPU availability trends using histori
 ## Setup
 
 1. **Get your API key**: [Lambda Cloud API Keys](https://cloud.lambdalabs.com/api-keys).
-2. **Environment**: Copy `env.example` to `.env` and set your `LAMBDA_CLOUD_API_KEY`.
+2. **Environment**: Copy `env.example` to `.env` and set your `LAMBDA_CLOUD_API_KEY`. A variable already set in the process environment wins. The global `captcha-gpu` command also loads `$CAPTCHA_GPU_ROOT/.env` from any working directory.
 3. **Dependencies**:
    - **lambda-cloud-api**: Requires [Rust/Cargo](https://rustup.rs).
    - **gpu-forecaster**: Requires [Pixi](https://pixi.sh).

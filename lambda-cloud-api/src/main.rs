@@ -3,10 +3,9 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use csv::WriterBuilder;
 use dialoguer::{Confirm, Select};
-use dotenvy::dotenv;
 use lambda_cloud_api::{
-    launch_and_setup, AcquireStop, LambdaCloudClient, LambdaConfig, LaunchTarget, PollBatch,
-    poll_until_acquired,
+    launch_and_setup, load_config_env, AcquireStop, LambdaCloudClient, LambdaConfig, LaunchTarget,
+    PollBatch, poll_until_acquired,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -101,7 +100,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
+    load_config_env();
     let cli = Cli::parse();
 
     let api_key = env::var("LAMBDA_CLOUD_API_KEY").context("LAMBDA_CLOUD_API_KEY environment variable not set")?;

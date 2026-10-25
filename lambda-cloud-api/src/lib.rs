@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Instance {
@@ -273,7 +274,32 @@ impl LambdaConfig {
             ssh_key_name: std::env::var("LAMBDA_SSH_KEY").ok().filter(|s| !s.is_empty()),
             public_ip: std::env::var("MY_PUBLIC_IP").ok().filter(|s| !s.is_empty()),
             instance_name_prefix: std::env::var("LAMBDA_INSTANCE_PREFIX")
-                .unwrap_or_else(|_| "lambda-captcha".to_string()),
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "lambda-captcha".to_string()),
+        }
+    }
+}
+
+/// Load configuration from the process environment and `.env` files.
+///
+/// Variables already set in the process are kept. Missing values are filled
+/// from `$CAPTCHA_GPU_ROOT/.env` (set by the global `captcha-gpu` command)
+/// and then from a `.env` in the working directory or its parents.
+pub fn load_config_env() {
+    let mut paths = Vec::new();
+    if let Some(root) = std::env::var("CAPTCHA_GPU_ROOT").ok().filter(|s| !s.is_empty()) {
+        paths.push(Path::new(&root).join(".env"));
+    }
+    load_dotenv_files(&paths);
+    dotenvy::dotenv().ok();
+}
+
+/// Set variables from these `.env` files without overriding the process environment.
+pub fn load_dotenv_files(paths: &[PathBuf]) {
+    for path in paths {
+        if path.is_file() {
+            dotenvy::from_path(path).ok();
         }
     }
 }
@@ -465,6 +491,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -580,5 +607,67 @@ mod tests {
         assert_eq!(stop, AcquireStop::<LaunchTarget>::Exhausted);
         assert_eq!(launches.load(Ordering::SeqCst), 0);
         assert_eq!(waits.load(Ordering::SeqCst), 0);
+    }
+
+    fn env_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "captcha-gpu-env-{}-{}-{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn process_env_wins_over_dotenv_file() {
+        let dir = env_test_dir("override");
+        std::fs::write(
+            dir.join(".env"),
+            "CAPTCHA_TEST_PRESENT=from-file\nCAPTCHA_TEST_ONLY_FILE=from-file\n",
+        )
+        .unwrap();
+        let previous_present = std::env::var("CAPTCHA_TEST_PRESENT").ok();
+        let previous_only = std::env::var("CAPTCHA_TEST_ONLY_FILE").ok();
+        std::env::set_var("CAPTCHA_TEST_PRESENT", "from-env");
+        std::env::remove_var("CAPTCHA_TEST_ONLY_FILE");
+
+        load_dotenv_files(&[dir.join(".env")]);
+
+        assert_eq!(std::env::var("CAPTCHA_TEST_PRESENT").unwrap(), "from-env");
+        assert_eq!(std::env::var("CAPTCHA_TEST_ONLY_FILE").unwrap(), "from-file");
+
+        restore_var("CAPTCHA_TEST_PRESENT", previous_present);
+        restore_var("CAPTCHA_TEST_ONLY_FILE", previous_only);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn global_root_dotenv_fills_unset_variables() {
+        let dir = env_test_dir("global");
+        std::fs::write(dir.join(".env"), "CAPTCHA_TEST_GLOBAL=from-root\n").unwrap();
+        let previous_root = std::env::var("CAPTCHA_GPU_ROOT").ok();
+        let previous_value = std::env::var("CAPTCHA_TEST_GLOBAL").ok();
+        std::env::remove_var("CAPTCHA_TEST_GLOBAL");
+        std::env::set_var("CAPTCHA_GPU_ROOT", &dir);
+
+        load_config_env();
+
+        assert_eq!(std::env::var("CAPTCHA_TEST_GLOBAL").unwrap(), "from-root");
+
+        restore_var("CAPTCHA_GPU_ROOT", previous_root);
+        restore_var("CAPTCHA_TEST_GLOBAL", previous_value);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn restore_var(key: &str, previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 }
