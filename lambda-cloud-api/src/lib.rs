@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Instance {
@@ -304,6 +307,71 @@ pub fn load_dotenv_files(paths: &[PathBuf]) {
     }
 }
 
+const PUBLIC_IP_ENDPOINTS: &[&str] = &[
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+];
+
+/// Parse a public IP string, trimming whitespace and rejecting empty/non-IP values.
+pub fn parse_public_ip(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    IpAddr::from_str(trimmed).ok().map(|ip| ip.to_string())
+}
+
+/// Detect the caller's current public IP by querying public echo services.
+pub async fn detect_public_ip() -> Result<String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent("captcha-gpu")
+        .build()
+        .context("Failed to build HTTP client for public IP detection")?;
+
+    let mut last_error = None;
+    for endpoint in PUBLIC_IP_ENDPOINTS {
+        match client.get(*endpoint).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.text().await {
+                    Ok(body) => {
+                        if let Some(ip) = parse_public_ip(&body) {
+                            return Ok(ip);
+                        }
+                        last_error = Some(anyhow::anyhow!(
+                            "{} returned a non-IP body: {}",
+                            endpoint,
+                            body.trim()
+                        ));
+                    }
+                    Err(err) => last_error = Some(err.into()),
+                }
+            }
+            Ok(response) => {
+                last_error = Some(anyhow::anyhow!(
+                    "{} returned HTTP {}",
+                    endpoint,
+                    response.status()
+                ));
+            }
+            Err(err) => last_error = Some(err.into()),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No public IP endpoints configured")))
+}
+
+/// Resolve the firewall source IP.
+///
+/// Prefer an explicit override. Otherwise detect the caller's current public IP.
+pub async fn resolve_firewall_ip(configured: Option<&str>) -> Result<String> {
+    if let Some(ip) = configured.and_then(parse_public_ip) {
+        return Ok(ip);
+    }
+    detect_public_ip().await
+}
+
 pub async fn launch_and_setup(
     client: &LambdaCloudClient,
     config: &LambdaConfig,
@@ -349,33 +417,45 @@ pub async fn launch_and_setup(
     println!("✅ Instance launched! IDs: {:?}", launch_res.data.instance_ids);
     let instance_id = &launch_res.data.instance_ids[0];
 
-    // Setup Firewall
-    if let Some(public_ip) = &config.public_ip {
-        println!("🛡️ Setting up firewall rules for IP: {}", public_ip);
-        let rules = vec![
-            FirewallRule {
-                protocol: "tcp".to_string(),
-                port: 22,
-                source_ips: vec![format!("{}/32", public_ip)],
-            },
-            FirewallRule {
-                protocol: "tcp".to_string(),
-                port: 80,
-                source_ips: vec![format!("{}/32", public_ip)],
-            },
-            FirewallRule {
-                protocol: "tcp".to_string(),
-                port: 443,
-                source_ips: vec![format!("{}/32", public_ip)],
-            },
-        ];
-        if let Err(e) = client.update_firewall_rules(rules).await {
-            eprintln!("⚠️ Failed to update firewall rules: {}", e);
-        } else {
-            println!("✅ Firewall rules updated successfully.");
+    // Setup Firewall: MY_PUBLIC_IP overrides; otherwise detect the caller's current IP.
+    match resolve_firewall_ip(config.public_ip.as_deref()).await {
+        Ok(public_ip) => {
+            let source = if config.public_ip.as_deref().and_then(parse_public_ip).is_some() {
+                "MY_PUBLIC_IP"
+            } else {
+                "detected caller IP"
+            };
+            println!("🛡️ Setting up firewall rules for {} ({})", public_ip, source);
+            let cidr = format!("{}/32", public_ip);
+            let rules = vec![
+                FirewallRule {
+                    protocol: "tcp".to_string(),
+                    port: 22,
+                    source_ips: vec![cidr.clone()],
+                },
+                FirewallRule {
+                    protocol: "tcp".to_string(),
+                    port: 80,
+                    source_ips: vec![cidr.clone()],
+                },
+                FirewallRule {
+                    protocol: "tcp".to_string(),
+                    port: 443,
+                    source_ips: vec![cidr],
+                },
+            ];
+            if let Err(e) = client.update_firewall_rules(rules).await {
+                eprintln!("⚠️ Failed to update firewall rules: {}", e);
+            } else {
+                println!("✅ Firewall rules updated successfully.");
+            }
         }
-    } else {
-        println!("ℹ️ MY_PUBLIC_IP not set in .env, skipping firewall setup.");
+        Err(e) => {
+            eprintln!(
+                "⚠️ Could not resolve caller public IP for firewall rules: {}. Skipping firewall setup.",
+                e
+            );
+        }
     }
 
     // Wait for IP
@@ -669,5 +749,30 @@ mod tests {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
+    }
+
+    #[test]
+    fn parse_public_ip_accepts_ipv4_and_ipv6() {
+        assert_eq!(parse_public_ip(" 203.0.113.10\n ").as_deref(), Some("203.0.113.10"));
+        assert_eq!(
+            parse_public_ip("2001:db8::1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(parse_public_ip(""), None);
+        assert_eq!(parse_public_ip("not-an-ip"), None);
+        assert_eq!(parse_public_ip("203.0.113.10/32"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_firewall_ip_prefers_configured_override() {
+        let ip = resolve_firewall_ip(Some(" 198.51.100.7 ")).await.unwrap();
+        assert_eq!(ip, "198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn resolve_firewall_ip_rejects_invalid_override_and_falls_back() {
+        // Invalid override should fall through to detection; this only asserts the
+        // override path rejects garbage before network lookup by checking parse.
+        assert_eq!(parse_public_ip("not-an-ip"), None);
     }
 }

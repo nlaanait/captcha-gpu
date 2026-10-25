@@ -21,7 +21,7 @@ cargo run --manifest-path lambda-cloud-api/Cargo.toml --bin captcha-gpu --releas
 
 `LAMBDA_CLOUD_API_KEY` is read from the process environment first. If it is unset, it is filled from `$CAPTCHA_GPU_ROOT/.env` (the global `captcha-gpu` command sets that to the repo) and then from `.env` in the working directory or its parents. If it is missing, ask the user. Do not invent a key and do not print it.
 
-The same order applies to `LAMBDA_SSH_KEY` (otherwise the first key on the account), `MY_PUBLIC_IP` (restricts firewall ports 22/80/443), and `LAMBDA_INSTANCE_PREFIX` (default `lambda-captcha`).
+The same order applies to `LAMBDA_SSH_KEY` (otherwise the first key on the account), `MY_PUBLIC_IP` (optional firewall override for ports 22/80/443; when unset, captcha-gpu detects the caller's current public IP), and `LAMBDA_INSTANCE_PREFIX` (default `lambda-captcha`).
 
 ## Modes
 
